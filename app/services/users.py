@@ -131,6 +131,7 @@ class UserService:
         fullname: Optional[str] = None,
         phone: Optional[str] = None,
         email: Optional[str] = None,
+        avatar_path: Optional[str] = None,
         password: Optional[str] = None,
         is_admin: Optional[bool] = None,
         status: Optional[str] = None,
@@ -159,6 +160,8 @@ class UserService:
                     update_values["phone"] = phone
                 if email is not None:
                     update_values["email"] = email
+                if avatar_path is not None:
+                    update_values["avatar_path"] = avatar_path
                 if is_admin is not None:
                     update_values["is_admin"] = is_admin
                 if status is not None:

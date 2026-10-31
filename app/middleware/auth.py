@@ -5,6 +5,7 @@
 """
 from fastapi import Request
 import requests
+import re
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.types import ASGIApp
 from app.services.users import UserService
@@ -56,7 +57,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
         # 添加静态文件扩展名列表
         self.static_extensions = [
             ".js", ".css", ".html", ".htm", ".json", ".png", 
-            ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".eot", 
+            ".jpg", ".jpeg", ".webp", ".gif", ".svg", ".ico", ".eot",
             ".woff", ".woff2", ".ttf", ".otf"
         ]
     
@@ -172,6 +173,11 @@ class AuthMiddleware(BaseHTTPMiddleware):
     
     def _is_public_api_path(self, path: str) -> bool:
         """检查路径是否为公开API路径"""
+        avatar_prefix = f"{settings.API_PREFIX.rstrip('/')}/auth/avatars/"
+        if path.startswith(avatar_prefix):
+            filename = path[len(avatar_prefix):]
+            return bool(re.fullmatch(r"[0-9a-f]{32}\.(?:png|jpg|webp)", filename))
+
         return any(
             path.startswith(public_path) or path.endswith(public_path)
             for public_path in self.public_api_paths

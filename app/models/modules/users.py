@@ -42,6 +42,7 @@ class User(Base):
     fullname = Column(String(100))
     phone = Column(String(20))
     email = Column(String(100))
+    avatar_path = Column(String(255), nullable=True)
     is_admin = Column(Boolean, default=False)
     status = Column(String(20), default="active")
     external_id = Column(String(100))

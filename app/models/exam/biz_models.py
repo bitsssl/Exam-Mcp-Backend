@@ -242,6 +242,29 @@ class BizExamGradingTemplate(Base):
     created_at = Column(DateTime, nullable=False, default=now_beijing)
     updated_at = Column(DateTime, nullable=False, default=now_beijing, onupdate=now_beijing)
 
+
+class BizExamGradingTask(Base):
+    """教师创建的阅卷任务与试卷包、阅卷配置的关联。"""
+
+    __tablename__ = "biz_exam_grading_task"
+    __table_args__ = (
+        Index("idx_biz_exam_grading_task_creator", "creator_id"),
+        Index("idx_biz_exam_grading_task_package", "local_package_id"),
+        Index("idx_biz_exam_grading_task_exam", "subject_id", "exam_id"),
+        Index("uq_biz_exam_grading_task_creator_package", "creator_id", "local_package_id", unique=True),
+        {"extend_existing": True},
+    )
+
+    task_id = Column(Integer, primary_key=True, autoincrement=True)
+    # 以普通关联 ID 保存，避免任务记录改变既有科目、试卷包、标准或模板的删除行为。
+    subject_id = Column(Integer, nullable=False)
+    exam_id = Column(Integer, nullable=False)
+    local_package_id = Column(Integer, nullable=False)
+    standard_id = Column(Integer, nullable=False)
+    template_id = Column(Integer, nullable=False)
+    creator_id = Column(Integer, nullable=False)
+    created_at = Column(DateTime, nullable=False, default=now_beijing)
+
 class BizLocalGradingRecord(Base):
     """本地试卷包评分结果表。"""
 

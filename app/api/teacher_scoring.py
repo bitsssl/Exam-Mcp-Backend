@@ -20,7 +20,7 @@ from starlette.routing import Route
 
 from app.core.config import settings
 from app.models.engine import engine, get_db
-from app.models.exam.biz_models import BizAnswerFile, BizAnswerSheet, BizExam, BizExamGradingStandard, BizExamGradingStandardItem, BizExamGradingTemplate, BizExamPackage, BizLocalExamPackage, BizLocalGradingRecord, BizSubject
+from app.models.exam.biz_models import BizAnswerFile, BizAnswerSheet, BizExam, BizExamGradingStandard, BizExamGradingStandardItem, BizExamGradingTemplate, BizExamGradingTask, BizExamPackage, BizLocalExamPackage, BizLocalGradingRecord, BizSubject
 from app.models.modules.users import User
 from app.models.modules.mcp_modules import McpModule
 from app.models.modules.mcp_services import McpService
@@ -100,8 +100,8 @@ def _current_teacher(request: Request):
     user = getattr(request.state, "user", None)
     if not user:
         return None, error_response("未登录", code=401, http_status_code=401)
-    if user.get("is_admin"):
-        return None, error_response("管理员不能访问教师评分工作台", code=403, http_status_code=403)
+    # 管理员与普通用户共用评分工作台能力；业务记录仍按 user_id 隔离，
+    # 所以管理员访问时只会读写管理员账号自己创建的科目、考试和试卷包。
     return user, None
 
 
@@ -496,6 +496,15 @@ def _ensure_local_package_schema():
         raise
 
 
+def _ensure_grading_task_schema():
+    """为已有数据库按需创建阅卷任务关联表。"""
+    try:
+        BizExamGradingTask.__table__.create(bind=engine, checkfirst=True)
+    except Exception as exc:
+        mcp_logger.error(f"创建阅卷任务表失败: {exc}")
+        raise
+
+
 def _local_package_file_url(package: BizLocalExamPackage, relative_path: str) -> str:
     path_text = str(relative_path or "").replace("\\", "/").lstrip("/")
     return (
@@ -503,6 +512,25 @@ def _local_package_file_url(package: BizLocalExamPackage, relative_path: str) ->
         f"exams/{package.exam_id}/local-packages/{package.local_package_id}/files"
         f"?path={quote(path_text, safe='')}"
     )
+
+
+def _resolve_local_package_storage_root(package: BizLocalExamPackage):
+    """Resolve local-package files from the current backend storage root only."""
+    stored_path = str(getattr(package, "parsed_storage_path", None) or "").strip()
+    if not stored_path:
+        return None
+
+    relative_path = Path(stored_path)
+    if relative_path.is_absolute() or ".." in relative_path.parts:
+        return None
+
+    try:
+        base_dir = Path(settings.MCP_BASE_DIR).resolve()
+        candidate = (base_dir / relative_path).resolve()
+        candidate.relative_to(base_dir)
+    except (OSError, ValueError):
+        return None
+    return candidate if candidate.is_dir() else None
 
 
 def _enrich_local_package_file_links(package: BizLocalExamPackage, value):
@@ -2194,7 +2222,9 @@ def _resolve_student_answer_folder(local_package, student_no):
     safe_student_no = _safe_upload_name(student_no)
     if not safe_student_no:
         return None
-    root = (Path(settings.MCP_BASE_DIR) / local_package.parsed_storage_path).resolve()
+    root = _resolve_local_package_storage_root(local_package)
+    if root is None:
+        return None
     input_root = root / "input"
     if not input_root.is_dir():
         return None
@@ -2205,16 +2235,51 @@ def _resolve_student_answer_folder(local_package, student_no):
                 candidates.append(paper_dir / safe_student_no)
     except OSError:
         pass
-    for candidate in candidates:
+
+    seen_candidates = set()
+
+    def _usable_candidate(candidate):
         try:
+            normalized_candidate = candidate.resolve()
+            if normalized_candidate in seen_candidates:
+                return None
+            seen_candidates.add(normalized_candidate)
+            normalized_candidate.relative_to(input_root.resolve())
             if not candidate.is_dir():
-                continue
+                return None
             ks_folder = candidate / "KS"
+            candidate_entries = list(candidate.iterdir())
             if ks_folder.is_dir():
-                return ks_folder
-            return candidate
+                if any(ks_folder.iterdir()):
+                    return ks_folder
+                if any(item.name.casefold() != "ks" for item in candidate_entries):
+                    return candidate
+                return None
+            if candidate_entries:
+                return candidate
         except OSError:
-            continue
+            return None
+        except ValueError:
+            return None
+        return None
+
+    for candidate in candidates:
+        answer_folder = _usable_candidate(candidate)
+        if answer_folder is not None:
+            return answer_folder
+
+    # Uploaded folders may contain extra grouping levels (for example
+    # input/batch/section/student/KS). Keep the common shallow lookup fast,
+    # then walk only when the expected locations did not contain the student.
+    try:
+        for current_root, directory_names, _ in os.walk(input_root):
+            if safe_student_no not in directory_names:
+                continue
+            answer_folder = _usable_candidate(Path(current_root) / safe_student_no)
+            if answer_folder is not None:
+                return answer_folder
+    except OSError:
+        pass
     return None
 
 
@@ -2239,7 +2304,9 @@ def _resolve_student_answer_images(local_package, student_no, topic_index):
     parts = entry.get("result") or []
     if topic_index >= len(parts):
         return {}
-    package_root = (Path(settings.MCP_BASE_DIR) / local_package.parsed_storage_path).resolve()
+    package_root = _resolve_local_package_storage_root(local_package)
+    if package_root is None:
+        return {}
     result = {}
     sub_questions = parts[topic_index].get("sub_question") or []
     for sub_index, sub_question in enumerate(sub_questions, 1):
@@ -2368,6 +2435,32 @@ def _iter_result_dicts(result):
     yield from walk(normalized)
 
 
+def _iter_result_texts(result):
+    """Yield plain-text leaves so score-only MCP replies can be normalized too."""
+    visited = set()
+
+    def walk(value):
+        value = _parse_result_json(value)
+        if isinstance(value, dict):
+            marker = id(value)
+            if marker in visited:
+                return
+            visited.add(marker)
+            for child in value.values():
+                yield from walk(child)
+        elif isinstance(value, list):
+            marker = id(value)
+            if marker in visited:
+                return
+            visited.add(marker)
+            for child in value:
+                yield from walk(child)
+        elif isinstance(value, str):
+            yield value
+
+    yield from walk(result)
+
+
 def _to_result_score(value):
     score = _to_decimal_or_none(value)
     if score is not None:
@@ -2424,6 +2517,22 @@ def _extract_result_score(result):
         for key in score_keys:
             score = _to_result_score(source.get(key))
             if score is not None:
+                return score
+
+    # Some legacy MCP services return only a text block (for example
+    # "本题得分：8/10分") instead of a JSON score field. Preserve the raw result,
+    # but still extract a score when the text labels it explicitly.
+    labeled_score = re.compile(
+        r"(?:total\s*score|final\s*score|earned\s*score|obtained\s*score|"
+        r"最终得分|得分|总分|评分结果|评分)\s*(?:为|是|[:：=])?\s*"
+        r"(-?\d+(?:\.\d+)?)(?:\s*/\s*-?\d+(?:\.\d+)?)?",
+        flags=re.IGNORECASE,
+    )
+    for text_value in _iter_result_texts(result):
+        match = labeled_score.search(text_value)
+        if match:
+            score = _to_decimal_or_none(match.group(1))
+            if score is not None and score >= 0:
                 return score
     return None
 
@@ -2940,6 +3049,36 @@ async def list_exams(request: Request):
     return success_response([_exam_to_dict(exam) for exam in exams])
 
 
+async def list_all_exams(request: Request):
+    """获取当前教师创建的全部考试，并附带所属科目信息。"""
+    user, error = _current_teacher(request)
+    if error:
+        return error
+
+    keyword = (request.query_params.get("keyword") or "").strip()
+    with get_db() as db:
+        query = (
+            select(BizExam, BizSubject.subject_no, BizSubject.subject_name)
+            .join(BizSubject, BizSubject.subject_id == BizExam.subject_id)
+            .where(
+                BizExam.creator_id == int(user["user_id"]),
+                BizSubject.creator_id == int(user["user_id"]),
+            )
+        )
+        if keyword:
+            query = query.where(BizExam.exam_name.like(f"%{keyword}%"))
+        query = query.order_by(BizExam.exam_time.desc(), BizExam.id.desc())
+        rows = db.execute(query).all()
+
+    exams = []
+    for exam, subject_no, subject_name in rows:
+        item = _exam_to_dict(exam)
+        item["subject_no"] = subject_no
+        item["subject_name"] = subject_name
+        exams.append(item)
+    return success_response(exams)
+
+
 async def create_exam(request: Request):
     """在指定科目下创建考试。"""
     user, error = _current_teacher(request)
@@ -3423,6 +3562,166 @@ async def list_grading_standard_versions(request: Request):
     return success_response([_grading_standard_to_dict(standard) for standard in standards])
 
 
+async def update_grading_standard(request: Request):
+    """Update one complete grading-standard version without creating a new version."""
+    user, error = _current_teacher(request)
+    if error:
+        return error
+    subject_id, subject_id_error = _get_subject_id(request)
+    if subject_id_error:
+        return subject_id_error
+    exam_id, exam_id_error = _get_exam_id(request)
+    if exam_id_error:
+        return exam_id_error
+    try:
+        standard_id = int(request.path_params["standard_id"])
+        data = await request.json()
+    except (KeyError, TypeError, ValueError):
+        return error_response("阅卷标准ID不正确", code=400, http_status_code=400)
+    except Exception:
+        return error_response("阅卷标准内容格式不正确", code=400, http_status_code=400)
+
+    standard_items = data.get("standard_items")
+    if not isinstance(standard_items, list) or not standard_items:
+        return error_response("至少需要一道阅卷标准题目", code=400, http_status_code=400)
+    try:
+        normalized_items = [_normalize_standard_item_payload(item, index) for index, item in enumerate(standard_items, 1)]
+    except ValueError as exc:
+        return error_response(str(exc), code=400, http_status_code=400)
+
+    with get_db() as db:
+        exam = await _get_owned_exam(db, user["user_id"], subject_id, exam_id)
+        if not exam:
+            return error_response("考试不存在或无权访问", code=404, http_status_code=404)
+        standard = db.execute(select(BizExamGradingStandard).where(
+            BizExamGradingStandard.standard_id == standard_id,
+            BizExamGradingStandard.subject_id == subject_id,
+            BizExamGradingStandard.exam_id == exam_id,
+            BizExamGradingStandard.creator_id == int(user["user_id"]),
+        )).scalar_one_or_none()
+        if not standard:
+            return error_response("阅卷标准不存在或无权修改", code=404, http_status_code=404)
+
+        current_items = db.execute(select(BizExamGradingStandardItem).where(
+            BizExamGradingStandardItem.standard_id == standard_id,
+            BizExamGradingStandardItem.subject_id == subject_id,
+            BizExamGradingStandardItem.exam_id == exam_id,
+            BizExamGradingStandardItem.creator_id == int(user["user_id"]),
+        )).scalars().all()
+        current_by_id = {item.item_id: item for item in current_items}
+        current_by_question = {item.question_no: item for item in current_items}
+        keep_ids = set()
+        summaries = []
+        resolved = []
+        for item in normalized_items:
+            row = current_by_id.get(item.get("item_id")) or current_by_question.get(item["question_no"])
+            if row:
+                row.question_no = item["question_no"]
+                row.question_type = item["question_type"]
+                row.mcp_service_id = item["mcp_service_id"]
+                row.mcp_service_name = item["mcp_service_name"]
+                row.question_text = item["question_text"]
+                row.reference_answer = item["reference_answer"]
+                row.grading_criteria = item["grading_criteria"]
+                row.question_version_no = item["question_version_no"]
+                row.source_standard_version_no = standard.version_no
+                row.mcp_params = item["mcp_params"]
+                row.max_score = item["max_score"]
+                row.remark = item["remark"]
+            else:
+                row = BizExamGradingStandardItem(
+                    standard_id=standard_id, subject_id=subject_id, exam_id=exam_id,
+                    creator_id=int(user["user_id"]), question_no=item["question_no"],
+                    question_type=item["question_type"], mcp_service_id=item["mcp_service_id"],
+                    mcp_service_name=item["mcp_service_name"], question_text=item["question_text"],
+                    reference_answer=item["reference_answer"], grading_criteria=item["grading_criteria"],
+                    question_version_no=item["question_version_no"], source_standard_version_no=standard.version_no,
+                    mcp_params=item["mcp_params"], max_score=item["max_score"], remark=item["remark"],
+                )
+                db.add(row)
+                db.flush()
+            keep_ids.add(row.item_id)
+            item_data = _grading_standard_item_to_dict(row)
+            summaries.append({"question_no": row.question_no, "item_id": row.item_id,
+                              "question_version_no": row.question_version_no,
+                              "source_standard_version_no": row.source_standard_version_no})
+            resolved.append(item_data)
+        for item in current_items:
+            if item.item_id not in keep_ids:
+                db.delete(item)
+        standard.standard_items = summaries
+        standard._resolved_standard_items = resolved
+        db.commit()
+        db.refresh(standard)
+        standard._resolved_standard_items = resolved
+        result = _grading_standard_to_dict(standard)
+    return success_response(result, message="阅卷标准已更新", code=0)
+
+
+async def delete_grading_standard(request: Request):
+    """Delete one complete standard version when no grading data depends on it."""
+    user, error = _current_teacher(request)
+    if error:
+        return error
+    subject_id, subject_id_error = _get_subject_id(request)
+    if subject_id_error:
+        return subject_id_error
+    exam_id, exam_id_error = _get_exam_id(request)
+    if exam_id_error:
+        return exam_id_error
+    try:
+        standard_id = int(request.path_params["standard_id"])
+    except (KeyError, TypeError, ValueError):
+        return error_response("阅卷标准ID不正确", code=400, http_status_code=400)
+
+    with get_db() as db:
+        exam = await _get_owned_exam(db, user["user_id"], subject_id, exam_id)
+        if not exam:
+            return error_response("考试不存在或无权访问", code=404, http_status_code=404)
+        standard = db.execute(select(BizExamGradingStandard).where(
+            BizExamGradingStandard.standard_id == standard_id,
+            BizExamGradingStandard.subject_id == subject_id,
+            BizExamGradingStandard.exam_id == exam_id,
+            BizExamGradingStandard.creator_id == int(user["user_id"]),
+        )).scalar_one_or_none()
+        if not standard:
+            return error_response("阅卷标准不存在或无权删除", code=404, http_status_code=404)
+        if db.execute(select(BizLocalGradingRecord.record_id).where(
+            BizLocalGradingRecord.standard_id == standard_id
+        ).limit(1)).first():
+            return error_response("该标准版本已有阅卷记录，不能删除", code=409, http_status_code=409)
+        templates = db.execute(select(BizExamGradingTemplate).where(
+            BizExamGradingTemplate.subject_id == subject_id,
+            BizExamGradingTemplate.exam_id == exam_id,
+            BizExamGradingTemplate.creator_id == int(user["user_id"]),
+        )).scalars().all()
+        if any(any(int(item.get("standard_id") or 0) == standard_id for item in _ensure_list_payload(template.template_items) if isinstance(item, dict)) for template in templates):
+            return error_response("该标准版本已被阅卷模板引用，请先删除相关模板", code=409, http_status_code=409)
+
+        item_ids = {int(item.get("item_id")) for item in _ensure_list_payload(standard.standard_items)
+                    if isinstance(item, dict) and item.get("item_id")}
+        other_standards = db.execute(select(BizExamGradingStandard).where(
+            BizExamGradingStandard.subject_id == subject_id,
+            BizExamGradingStandard.exam_id == exam_id,
+            BizExamGradingStandard.creator_id == int(user["user_id"]),
+            BizExamGradingStandard.standard_id != standard_id,
+        )).scalars().all()
+        if any(any(int(item.get("item_id") or 0) in item_ids for item in _ensure_list_payload(other.standard_items) if isinstance(item, dict)) for other in other_standards):
+            return error_response("该标准题目已被其他版本复用，不能删除此版本", code=409, http_status_code=409)
+
+        owned_items = db.execute(select(BizExamGradingStandardItem).where(
+            BizExamGradingStandardItem.standard_id == standard_id,
+            BizExamGradingStandardItem.subject_id == subject_id,
+            BizExamGradingStandardItem.exam_id == exam_id,
+            BizExamGradingStandardItem.creator_id == int(user["user_id"]),
+        )).scalars().all()
+        for item in owned_items:
+            db.delete(item)
+        db.delete(standard)
+        db.commit()
+    return success_response({"standard_id": standard_id}, message="阅卷标准已删除", code=0)
+
+
 async def list_grading_templates(request: Request):
     """获取当前考试已组装的阅卷模板。"""
     user, error = _current_teacher(request)
@@ -3740,6 +4039,122 @@ async def create_grading_template(request: Request):
     return success_response(result, message="科目考试阅卷模板保存成功", code=0)
 
 
+async def update_grading_template(request: Request):
+    """更新教师已组装的阅卷模板，不创建新的模板记录。"""
+    user, error = _current_teacher(request)
+    if error:
+        return error
+
+    subject_id, subject_id_error = _get_subject_id(request)
+    if subject_id_error:
+        return subject_id_error
+    exam_id, exam_id_error = _get_exam_id(request)
+    if exam_id_error:
+        return exam_id_error
+    try:
+        template_id = int(request.path_params["template_id"])
+        data = await request.json()
+    except (KeyError, TypeError, ValueError):
+        return error_response("阅卷模板ID或数据格式不正确", code=400, http_status_code=400)
+    except Exception:
+        return error_response("阅卷模板数据格式不正确", code=400, http_status_code=400)
+
+    template_name = str(data.get("template_name") or "科目考试阅卷模板").strip() or "科目考试阅卷模板"
+    description = str(data.get("description") or "").strip() or None
+    template_items = data.get("template_items")
+    if not isinstance(template_items, list) or not template_items:
+        return error_response("请至少选择一条题目评阅标准", code=400, http_status_code=400)
+
+    normalized_requests = []
+    seen_questions = set()
+    standard_ids = set()
+    for index, item in enumerate(template_items, start=1):
+        if not isinstance(item, dict):
+            return error_response(f"第 {index} 条模板明细格式不正确", code=400, http_status_code=400)
+        question_no = str(item.get("question_no") or "").strip()
+        standard_id = _to_int_or_none(item.get("standard_id"))
+        item_id = _to_int_or_none(item.get("item_id"))
+        if not question_no:
+            return error_response(f"第 {index} 条模板明细缺少试题号", code=400, http_status_code=400)
+        if not standard_id:
+            return error_response(f"第 {index} 条模板明细缺少阅卷标准版本", code=400, http_status_code=400)
+        if question_no in seen_questions:
+            return error_response(f"试题 {question_no} 重复选择", code=400, http_status_code=400)
+        seen_questions.add(question_no)
+        standard_ids.add(standard_id)
+        normalized_requests.append({"question_no": question_no, "standard_id": standard_id, "item_id": item_id})
+
+    with get_db() as db:
+        exam = await _get_owned_exam(db, user["user_id"], subject_id, exam_id)
+        if not exam:
+            return error_response("考试不存在或无权访问", code=404, http_status_code=404)
+
+        template = db.execute(
+            select(BizExamGradingTemplate).where(
+                BizExamGradingTemplate.template_id == template_id,
+                BizExamGradingTemplate.subject_id == subject_id,
+                BizExamGradingTemplate.exam_id == exam_id,
+                BizExamGradingTemplate.creator_id == int(user["user_id"]),
+            )
+        ).scalar_one_or_none()
+        if not template:
+            return error_response("阅卷模板不存在或无权编辑", code=404, http_status_code=404)
+
+        standards = db.execute(
+            select(BizExamGradingStandard).where(
+                BizExamGradingStandard.subject_id == subject_id,
+                BizExamGradingStandard.exam_id == exam_id,
+                BizExamGradingStandard.creator_id == int(user["user_id"]),
+                BizExamGradingStandard.standard_id.in_(standard_ids),
+            )
+        ).scalars().all()
+        _resolve_all_standard_items_for_versions(db, standards, subject_id, exam_id, user["user_id"])
+        if len(standards) != len(standard_ids):
+            return error_response("存在无效的阅卷标准版本", code=400, http_status_code=400)
+
+        standard_map = {standard.standard_id: standard for standard in standards}
+        item_index = _build_standard_item_index(standards)
+        normalized_items = []
+        for request_item in normalized_requests:
+            standard_id = request_item["standard_id"]
+            question_no = request_item["question_no"]
+            item_id = request_item.get("item_id")
+            standard = standard_map[standard_id]
+            standard_item = None
+            if item_id:
+                standard_item = next(
+                    (
+                        item for item in _standard_items_for_standard(standard)
+                        if _to_int_or_none(item.get("item_id")) == item_id
+                    ),
+                    None,
+                )
+            if not standard_item:
+                standard_item = item_index.get((standard_id, question_no))
+            if not standard_item:
+                return error_response(
+                    f"V{standard.version_no} 中未找到试题 {question_no} 的评阅标准",
+                    code=400,
+                    http_status_code=400,
+                )
+            normalized_items.append({
+                "question_no": question_no,
+                "standard_id": standard.standard_id,
+                "standard_version_no": standard.version_no,
+                "question_version_no": standard_item.get("question_version_no") or 1,
+                "standard_item": standard_item,
+            })
+
+        template.template_name = template_name
+        template.description = description
+        template.template_items = normalized_items
+        db.commit()
+        db.refresh(template)
+        result = _grading_template_to_dict(template)
+
+    return success_response(result, message="科目考试阅卷模板更新成功", code=0)
+
+
 async def delete_grading_template(request: Request):
     """删除教师已组装的阅卷模板。"""
     user, error = _current_teacher(request)
@@ -3912,6 +4327,116 @@ async def copy_grading_template(request: Request):
         return error_response(f"复制阅卷模板失败: {str(exc)}", code=500, http_status_code=500)
 
     return success_response(result, message="阅卷模板已复制", code=0)
+
+
+async def grading_tasks(request: Request):
+    """读取或创建阅卷任务；评分结果仍写入既有本地阅卷记录。"""
+    user, error = _current_teacher(request)
+    if error:
+        return error
+
+    _ensure_local_package_schema()
+    _ensure_grading_task_schema()
+
+    if request.method == "GET":
+        with get_db() as db:
+            rows = db.execute(
+                select(BizExamGradingTask, BizLocalExamPackage, BizExam, BizSubject, BizExamGradingTemplate)
+                .join(BizLocalExamPackage, BizLocalExamPackage.local_package_id == BizExamGradingTask.local_package_id)
+                .join(BizExam, BizExam.id == BizExamGradingTask.exam_id)
+                .join(BizSubject, BizSubject.subject_id == BizExamGradingTask.subject_id)
+                .join(BizExamGradingTemplate, BizExamGradingTemplate.template_id == BizExamGradingTask.template_id)
+                .where(BizExamGradingTask.creator_id == int(user["user_id"]))
+                .order_by(BizExamGradingTask.created_at.desc(), BizExamGradingTask.task_id.desc())
+            ).all()
+            result = []
+            for task, package, exam, subject, template in rows:
+                result.append({
+                    "task_id": task.task_id,
+                    "subject_id": task.subject_id,
+                    "subject_no": subject.subject_no,
+                    "subject_name": subject.subject_name,
+                    "exam_id": task.exam_id,
+                    "exam_name": exam.exam_name,
+                    "local_package_id": task.local_package_id,
+                    "package_name": package.package_name,
+                    "student_count": package.student_count or 0,
+                    "package_fingerprint": package.package_fingerprint,
+                    "standard_id": task.standard_id,
+                    "template_id": task.template_id,
+                    "template_name": template.template_name,
+                    "template_items": _ensure_list_payload(template.template_items),
+                    "created_at": task.created_at.strftime("%Y-%m-%d %H:%M:%S") if task.created_at else None,
+                })
+        return success_response(result)
+
+    if request.method != "POST":
+        return error_response("请求方法不支持", code=405, http_status_code=405)
+
+    try:
+        data = await request.json()
+        subject_id = int(data.get("subject_id"))
+        exam_id = int(data.get("exam_id"))
+        local_package_id = int(data.get("local_package_id"))
+        standard_id = int(data.get("standard_id"))
+        template_id = int(data.get("template_id"))
+    except (TypeError, ValueError, AttributeError):
+        return error_response("科目、考试、试卷、阅卷标准和阅卷模板均为必选项", code=400, http_status_code=400)
+
+    with get_db() as db:
+        exam = await _get_owned_exam(db, user["user_id"], subject_id, exam_id)
+        if not exam:
+            return error_response("考试不存在或无权访问", code=404, http_status_code=404)
+        package = await _get_owned_local_package(db, user["user_id"], subject_id, exam_id, local_package_id)
+        if not package:
+            return error_response("试卷包不存在或无权访问", code=404, http_status_code=404)
+        existing_task = db.execute(select(BizExamGradingTask.task_id).where(
+            BizExamGradingTask.creator_id == int(user["user_id"]),
+            BizExamGradingTask.local_package_id == local_package_id,
+        )).scalar_one_or_none()
+        if existing_task:
+            return error_response("该试卷包已创建阅卷任务，请在阅卷管理列表中查看", code=409, http_status_code=409)
+        standard = db.execute(select(BizExamGradingStandard).where(
+            BizExamGradingStandard.standard_id == standard_id,
+            BizExamGradingStandard.subject_id == subject_id,
+            BizExamGradingStandard.exam_id == exam_id,
+            BizExamGradingStandard.creator_id == int(user["user_id"]),
+        )).scalar_one_or_none()
+        if not standard:
+            return error_response("阅卷标准不存在或无权访问", code=404, http_status_code=404)
+        template = db.execute(select(BizExamGradingTemplate).where(
+            BizExamGradingTemplate.template_id == template_id,
+            BizExamGradingTemplate.subject_id == subject_id,
+            BizExamGradingTemplate.exam_id == exam_id,
+            BizExamGradingTemplate.creator_id == int(user["user_id"]),
+        )).scalar_one_or_none()
+        if not template:
+            return error_response("阅卷模板不存在或无权访问", code=404, http_status_code=404)
+
+        task = BizExamGradingTask(
+            subject_id=subject_id,
+            exam_id=exam_id,
+            local_package_id=local_package_id,
+            standard_id=standard_id,
+            template_id=template_id,
+            creator_id=int(user["user_id"]),
+        )
+        db.add(task)
+        db.commit()
+        db.refresh(task)
+        result = {
+            "task_id": task.task_id,
+            "subject_id": subject_id,
+            "exam_id": exam_id,
+            "local_package_id": local_package_id,
+            "standard_id": standard_id,
+            "template_id": template_id,
+            "package_name": package.package_name,
+            "template_name": template.template_name,
+            "created_at": task.created_at.strftime("%Y-%m-%d %H:%M:%S") if task.created_at else None,
+        }
+
+    return success_response(result, message="阅卷任务已创建", code=0)
 
 
 async def exam_grading_templates(request: Request):
@@ -4205,6 +4730,35 @@ async def process_local_package(request: Request):
             if not getattr(upload, "filename", None):
                 continue
             raw_relative = str(relative_paths[index] if index < len(relative_paths) else upload.filename)
+            if Path(upload.filename).suffix.lower() == ".zip":
+                archive_path = Path(upload.filename).name
+                try:
+                    with zipfile.ZipFile(upload.file) as archive:
+                        for member in archive.infolist():
+                            raw_member_path = member.filename.replace("\\", "/")
+                            member_path = Path(raw_member_path)
+                            if member_path.is_absolute() or ".." in member_path.parts:
+                                continue
+                            safe_parts = [part for part in member_path.parts if part not in ("", ".")]
+                            if not safe_parts:
+                                continue
+                            relative_member = Path(*safe_parts)
+                            target = input_dir / relative_member
+                            if member.is_dir():
+                                target.mkdir(parents=True, exist_ok=True)
+                                folder_paths.append(relative_member.as_posix())
+                                continue
+                            target.parent.mkdir(parents=True, exist_ok=True)
+                            with archive.open(member) as source, target.open("wb") as destination:
+                                _copy_stream_in_chunks(source, destination)
+                            saved_inputs.append(target)
+                            parent = relative_member.parent
+                            while parent.parts:
+                                folder_paths.append(parent.as_posix())
+                                parent = parent.parent
+                except zipfile.BadZipFile as exc:
+                    raise ValueError(f"压缩包无法读取：{archive_path}") from exc
+                continue
             relative = Path(raw_relative.replace("\\", "/"))
             if relative.is_absolute() or ".." in relative.parts:
                 continue
@@ -4420,11 +4974,9 @@ async def import_local_package_reference_answers(request: Request):
                 http_status_code=400,
             )
 
-        root = (Path(settings.MCP_BASE_DIR) / package.parsed_storage_path).resolve()
-        try:
-            root.relative_to(Path(settings.MCP_BASE_DIR).resolve())
-        except ValueError:
-            return error_response("试卷包存储路径不正确", code=400, http_status_code=400)
+        root = _resolve_local_package_storage_root(package)
+        if root is None:
+            return error_response("本地试卷包文件不存在", code=404, http_status_code=404)
 
         structure_summary = package.structure_summary or {}
         answer_path = _find_supporting_word_document(
@@ -4529,7 +5081,9 @@ async def get_local_package_file(request: Request):
         package = await _get_owned_local_package(db, user["user_id"], subject_id, exam_id, local_package_id)
         if not package or not package.parsed_storage_path:
             return error_response("本地试卷包文件不存在", code=404, http_status_code=404)
-        root = (Path(settings.MCP_BASE_DIR) / package.parsed_storage_path).resolve()
+        root = _resolve_local_package_storage_root(package)
+        if root is None:
+            return error_response("本地试卷包文件不存在", code=404, http_status_code=404)
         target = (root / relative_path).resolve()
         try:
             target.relative_to(root)
@@ -4608,7 +5162,9 @@ async def get_local_package_structure(request: Request):
             return error_response("本地试卷包不存在或无权访问", code=404, http_status_code=404)
         if not getattr(package, "parsed_storage_path", None):
             return error_response("试卷包尚未完成解析，无结构可预检", code=400, http_status_code=400)
-        root = Path(settings.MCP_BASE_DIR) / package.parsed_storage_path
+        root = _resolve_local_package_storage_root(package)
+        if root is None:
+            return error_response("试卷包尚未完成解析，无结构可预检", code=400, http_status_code=400)
         # paper 由 input 目录自动推断（如 33A），可用查询参数覆盖
         paper = (request.query_params.get("paper") or "").strip()
         # 包记录里上传时明确指定的答案卷/空白卷文件名（显式定位优先）
@@ -4911,6 +5467,119 @@ async def list_packages(request: Request):
     return success_response([_package_to_dict(package) for package in packages])
 
 
+async def list_all_packages(request: Request):
+    """获取当前教师名下全部考试的试卷包，供独立答卷管理页面使用。"""
+    user, error = _current_teacher(request)
+    if error:
+        return error
+
+    keyword = (request.query_params.get("keyword") or "").strip()
+    subject_id = request.query_params.get("subject_id")
+    exam_id = request.query_params.get("exam_id")
+    with get_db() as db:
+        query = (
+            select(BizExamPackage, BizExam, BizSubject)
+            .join(BizExam, BizExam.id == BizExamPackage.exam_id)
+            .join(BizSubject, BizSubject.subject_id == BizExam.subject_id)
+            .where(
+                BizExam.creator_id == int(user["user_id"]),
+                BizSubject.creator_id == int(user["user_id"]),
+            )
+        )
+        if subject_id:
+            try:
+                query = query.where(BizSubject.subject_id == int(subject_id))
+            except (TypeError, ValueError):
+                return error_response("科目编号无效")
+        if exam_id:
+            try:
+                query = query.where(BizExam.id == int(exam_id))
+            except (TypeError, ValueError):
+                return error_response("考试编号无效")
+        if keyword:
+            query = query.where(
+                or_(
+                    BizExamPackage.package_name.like(f"%{keyword}%"),
+                    BizExam.exam_name.like(f"%{keyword}%"),
+                )
+            )
+        query = query.order_by(BizExamPackage.uploaded_at.desc(), BizExamPackage.package_id.desc())
+        rows = db.execute(query).all()
+
+    packages = []
+    for package, exam, subject in rows:
+        item = _package_to_dict(package)
+        item.update({
+            "subject_id": subject.subject_id,
+            "subject_no": subject.subject_no,
+            "subject_name": subject.subject_name,
+            "exam_name": exam.exam_name,
+        })
+        packages.append(item)
+
+    # 独立答卷管理页还要展示原系统解析器创建的本地试卷包登记记录。
+    with get_db() as db:
+        local_query = (
+            # 列表只需要轻量摘要字段。不能 select ORM 整行：该实体包含
+            # parsed_students/file_manifest 等大型 JSON，MySQL 排序时会把
+            # 它们一并放入临时结果，数据量较大时触发 1038 Out of sort memory。
+            select(
+                BizLocalExamPackage.local_package_id,
+                BizLocalExamPackage.exam_id,
+                BizLocalExamPackage.subject_id,
+                BizLocalExamPackage.package_name,
+                BizLocalExamPackage.student_count,
+                BizLocalExamPackage.parsed_storage_path,
+                BizLocalExamPackage.created_at,
+                BizExam.exam_name,
+                BizSubject.subject_no,
+                BizSubject.subject_name,
+            )
+            .join(BizExam, BizExam.id == BizLocalExamPackage.exam_id)
+            .join(BizSubject, BizSubject.subject_id == BizLocalExamPackage.subject_id)
+            .where(
+                BizLocalExamPackage.creator_id == int(user["user_id"]),
+                BizLocalExamPackage.status == "active",
+                BizExam.creator_id == int(user["user_id"]),
+                BizSubject.creator_id == int(user["user_id"]),
+            )
+        )
+        if subject_id:
+            local_query = local_query.where(BizLocalExamPackage.subject_id == int(subject_id))
+        if exam_id:
+            local_query = local_query.where(BizLocalExamPackage.exam_id == int(exam_id))
+        if keyword:
+            local_query = local_query.where(
+                or_(
+                    BizLocalExamPackage.package_name.like(f"%{keyword}%"),
+                    BizExam.exam_name.like(f"%{keyword}%"),
+                )
+            )
+        local_rows = db.execute(local_query.order_by(
+            BizLocalExamPackage.created_at.desc(),
+            BizLocalExamPackage.local_package_id.desc(),
+        )).all()
+        for row in local_rows:
+            packages.append({
+                "package_id": f"local_{row.local_package_id}",
+                "local_package_id": row.local_package_id,
+                "isLocal": True,
+                "exam_id": row.exam_id,
+                "subject_id": row.subject_id,
+                "subject_no": row.subject_no,
+                "subject_name": row.subject_name,
+                "exam_name": row.exam_name,
+                "package_name": row.package_name,
+                "student_count": row.student_count,
+                "extract_path": row.parsed_storage_path or "parsed",
+                "uploaded_at": (
+                    row.created_at.strftime("%Y-%m-%d %H:%M:%S")
+                    if row.created_at else None
+                ),
+            })
+    return success_response(packages)
+
+
 async def create_package(request: Request):
     """创建试卷包并解析其中的考生答卷。"""
     user, error = _current_teacher(request)
@@ -4927,6 +5596,7 @@ async def create_package(request: Request):
     form = await request.form()
     package_name = (form.get("package_name") or "").strip()
     package_file = form.get("package_file")
+    blank_paper = form.get("blank_paper")
 
     if not package_name:
         return error_response("试卷包名称不能为空")
@@ -4960,6 +5630,15 @@ async def create_package(request: Request):
                 preview_json = json.loads(_decode_json_bytes(saved_path.read_bytes()))
                 if not _extract_student_entries(preview_json):
                     return error_response("JSON 文件中未找到可解析的考生答题数据")
+
+            blank_paper_path = await _save_exam_file(
+                blank_paper,
+                user["user_id"],
+                subject_id,
+                "blank_paper",
+            )
+            if blank_paper_path:
+                exam.blank_paper_path = blank_paper_path
 
             package = BizExamPackage(
                 exam_id=exam_id,
@@ -5843,8 +6522,11 @@ def get_router():
     return [
         Route("/subjects", list_subjects, methods=["GET"]),
         Route("/subjects", create_subject, methods=["POST"]),
+        Route("/exams", list_all_exams, methods=["GET"]),
         Route("/grade-with-mcp", grade_with_mcp, methods=["POST"]),
         Route("/grade-batch-with-mcp", grade_batch_with_mcp, methods=["POST"]),
+        Route("/packages", list_all_packages, methods=["GET"]),
+        Route("/grading-tasks", grading_tasks, methods=["GET", "POST"]),
         Route("/subjects/{subject_id}/exams/{exam_id}/local-packages/process", process_local_package, methods=["POST"]),
         Route("/subjects/{subject_id}/exams/{exam_id}/local-packages", register_local_package, methods=["POST"]),
         Route("/subjects/{subject_id}/exams/{exam_id}/local-packages/{local_package_id}/reference-answers/import", import_local_package_reference_answers, methods=["POST"]),
@@ -5860,6 +6542,9 @@ def get_router():
         Route("/subjects/{subject_id}/exams/{exam_id}/packages/{package_id}", package_detail, methods=["GET", "DELETE"]),
         Route("/subjects/{subject_id}/exams/{exam_id}/packages", exam_packages, methods=["GET", "POST"]),
         Route("/subjects/{subject_id}/exams/{exam_id}/grading-standards/versions", list_grading_standard_versions, methods=["GET"]),
+        Route("/subjects/{subject_id}/exams/{exam_id}/grading-standards/{standard_id}", update_grading_standard, methods=["PUT"]),
+        Route("/subjects/{subject_id}/exams/{exam_id}/grading-standards/{standard_id}", delete_grading_standard, methods=["DELETE"]),
+        Route("/subjects/{subject_id}/exams/{exam_id}/grading-templates/{template_id}", update_grading_template, methods=["PUT"]),
         Route("/subjects/{subject_id}/exams/{exam_id}/grading-templates/{template_id}", delete_grading_template, methods=["DELETE"]),
         Route("/subjects/{subject_id}/exams/{exam_id}/grading-templates/{template_id}/copy", copy_grading_template, methods=["POST"]),
         Route("/subjects/{subject_id}/exams/{exam_id}/grading-templates", exam_grading_templates, methods=["GET", "POST"]),

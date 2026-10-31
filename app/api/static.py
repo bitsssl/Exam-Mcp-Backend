@@ -58,6 +58,8 @@ def get_media_type(file_path):
         return 'application/json'
     elif file_path.endswith('.png'):
         return 'image/png'
+    elif file_path.endswith('.webp'):
+        return 'image/webp'
     elif file_path.endswith('.jpg') or file_path.endswith('.jpeg'):
         return 'image/jpeg'
     elif file_path.endswith('.gif'):

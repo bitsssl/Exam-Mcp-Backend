@@ -7,8 +7,13 @@ from starlette.requests import Request
 from starlette.responses import Response
 import json
 import re
+import uuid
 from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Optional
 import jwt as pyjwt  # 重命名以确保使用正确的PyJWT库
+from starlette.datastructures import UploadFile
+from starlette.responses import FileResponse
 
 from app.services.users import UserService, TenantService
 from app.core.config import settings
@@ -19,6 +24,74 @@ from app.utils.response import success_response, error_response
 SECRET_KEY = settings.JWT_SECRET_KEY
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 1440  # 24小时
+AVATAR_DIRECTORY = Path(settings.MCP_BASE_DIR) / "data" / "user-avatars"
+MAX_AVATAR_SIZE = 5 * 1024 * 1024
+
+
+def _avatar_url(user) -> str:
+    """为用户头像生成新后端提供的静态访问地址。"""
+    avatar_path = getattr(user, "avatar_path", None)
+    if not avatar_path:
+        return ""
+
+    normalized_path = str(avatar_path).replace("\\", "/")
+    filename = Path(normalized_path).name
+    if not re.fullmatch(r"[0-9a-f]{32}\.(?:png|jpg|webp)", filename):
+        return ""
+    if normalized_path != f"data/user-avatars/{filename}":
+        return ""
+    return f"{settings.API_PREFIX.rstrip('/')}/auth/avatars/{filename}"
+
+
+def _avatar_extension(content: bytes) -> str:
+    """根据文件签名确认格式，避免信任客户端提供的扩展名和 MIME 类型。"""
+    if content.startswith(b"\x89PNG\r\n\x1a\n"):
+        return ".png"
+    if content.startswith(b"\xff\xd8\xff"):
+        return ".jpg"
+    if len(content) >= 12 and content[:4] == b"RIFF" and content[8:12] == b"WEBP":
+        return ".webp"
+    return ""
+
+
+def _remove_managed_avatar(avatar_path: Optional[str]) -> None:
+    """只清理本功能生成、且位于新后端头像目录内的旧文件。"""
+    if not avatar_path:
+        return
+    normalized_path = str(avatar_path).replace("\\", "/")
+    filename = Path(normalized_path).name
+    if not re.fullmatch(r"[0-9a-f]{32}\.(?:png|jpg|webp)", filename):
+        return
+    if normalized_path != f"data/user-avatars/{filename}":
+        return
+    candidate = AVATAR_DIRECTORY / filename
+    if candidate.parent.resolve() == AVATAR_DIRECTORY.resolve() and candidate.is_file():
+        candidate.unlink(missing_ok=True)
+
+
+async def get_user_avatar(request: Request):
+    """提供用户随机命名的头像图片。"""
+    filename = request.path_params.get("filename", "")
+    if not re.fullmatch(r"[0-9a-f]{32}\.(?:png|jpg|webp)", filename):
+        return Response("File not found", status_code=404)
+
+    file_path = AVATAR_DIRECTORY / filename
+    if not file_path.is_file():
+        return Response("File not found", status_code=404)
+
+    media_type = {
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".webp": "image/webp",
+    }[file_path.suffix]
+    return FileResponse(
+        file_path,
+        media_type=media_type,
+        headers={
+            "Cache-Control": "public, max-age=31536000, immutable",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
 
 
 async def login(request: Request):
@@ -61,6 +134,8 @@ async def login(request: Request):
             "username": user.username,
             "fullname": user.fullname,
             "phone": user.phone,
+            "email": user.email,
+            "avatar": _avatar_url(user),
             "is_admin": user.is_admin,
             "tenants": tenant_list,
             "token": token
@@ -203,6 +278,7 @@ async def get_current_user(request: Request):
         "fullname": user.fullname,
         "phone": user.phone,
         "email": user.email,
+        "avatar": _avatar_url(user),
         "is_admin": user.is_admin,
         "status": user.status,
         "tenants": tenant_list
@@ -509,12 +585,77 @@ async def update_profile(request: Request):
             "fullname": updated_user.fullname,
             "phone": updated_user.phone,
             "email": updated_user.email,
+            "avatar": _avatar_url(updated_user),
             "is_admin": updated_user.is_admin,
             "status": updated_user.status,
         }, "个人资料已更新")
     except Exception as e:
         mcp_logger.error(f"更新个人资料失败: {str(e)}")
         return error_response("处理请求时发生错误", code=500, http_status_code=500)
+
+
+async def upload_avatar(request: Request):
+    """上传当前用户头像，文件仅写入新后端的数据目录。"""
+    if not hasattr(request.state, 'user'):
+        return error_response("未登录", code=401, http_status_code=401)
+
+    user_id = request.state.user.get("user_id")
+    if not user_id:
+        return error_response("未登录", code=401, http_status_code=401)
+
+    saved_path = None
+    avatar_updated = False
+    image_file = None
+    try:
+        form = await request.form()
+        image_file = form.get("file")
+        if not isinstance(image_file, UploadFile):
+            return error_response("请选择要上传的头像文件", code=400, http_status_code=400)
+
+        image_data = await image_file.read(MAX_AVATAR_SIZE + 1)
+        if not image_data:
+            return error_response("头像文件不能为空", code=400, http_status_code=400)
+        if len(image_data) > MAX_AVATAR_SIZE:
+            return error_response("头像文件不能超过 5 MB", code=400, http_status_code=400)
+
+        extension = _avatar_extension(image_data)
+        if not extension:
+            return error_response("仅支持 PNG、JPG 或 WebP 格式的头像", code=400, http_status_code=400)
+
+        current_user = UserService.get_user_by_id(user_id)
+        if not current_user:
+            return error_response("用户不存在", code=401, http_status_code=401)
+
+        AVATAR_DIRECTORY.mkdir(parents=True, exist_ok=True)
+        filename = f"{uuid.uuid4().hex}{extension}"
+        target_path = AVATAR_DIRECTORY / filename
+        target_path.write_bytes(image_data)
+        saved_path = f"data/user-avatars/{filename}"
+
+        if not UserService.update_user(user_id=user_id, avatar_path=saved_path):
+            target_path.unlink(missing_ok=True)
+            return error_response("保存头像失败", code=500, http_status_code=500)
+        avatar_updated = True
+
+        updated_user = UserService.get_user_by_id(user_id)
+        if not updated_user:
+            return error_response("头像已保存，但读取用户信息失败", code=500, http_status_code=500)
+
+        if current_user.avatar_path and current_user.avatar_path != saved_path:
+            _remove_managed_avatar(current_user.avatar_path)
+
+        return success_response({"avatar": _avatar_url(updated_user)}, "头像已更新")
+    except Exception as e:
+        if saved_path and not avatar_updated:
+            _remove_managed_avatar(saved_path)
+        mcp_logger.error(f"上传用户头像失败: {str(e)}")
+        return error_response("上传头像时发生错误", code=500, http_status_code=500)
+    finally:
+        if isinstance(image_file, UploadFile):
+            try:
+                await image_file.close()
+            except Exception:
+                pass
 
 
 # ============= 租户管理 =============
@@ -751,7 +892,9 @@ def get_router():
         Route("/register", register, methods=["POST"]),
         Route("/logout", logout, methods=["POST"]),
         Route("/current-user", get_current_user, methods=["GET"]),
+        Route("/avatars/{filename}", get_user_avatar, methods=["GET"]),
         Route("/profile", update_profile, methods=["PUT"]),
+        Route("/profile/avatar", upload_avatar, methods=["POST"]),
         Route("/users", get_users, methods=["GET"]),
         Route("/users", create_user, methods=["POST"]),
         Route("/users/{user_id:int}", update_user, methods=["PUT"]),

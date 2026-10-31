@@ -20,3 +20,14 @@ This is the Python 3.11 FastAPI and MCP backend migrated from the working system
    ```
 
 The API listens on `http://127.0.0.1:8002`; OpenAPI is available at `/docs`. Runtime uploads, parsed answer packages, logs, local databases, and private configuration remain under ignored paths.
+
+## Local answer package storage
+
+Parsed packages and their image/answer files are stored under
+`data/teacher_scoring/local-packages` relative to this backend directory. The
+database stores paths relative to the backend root, so this directory must be
+copied or mounted into the same relative location when moving the database and
+deploying the backend. The directory is intentionally excluded from Git because
+it contains uploaded student files; it must be migrated as deployment data and
+persisted independently from the code. The running application reads package
+files only from its own backend root.
